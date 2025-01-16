@@ -1,0 +1,348 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="initial-scale=1.0, width=device-width">
+  <title>AI Squat Coach</title>
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/tailwindcss/2.2.19/tailwind.min.css" rel="stylesheet">
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@3.11.0"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/pose-detection@2.0.0"></script>
+  <style>
+    @keyframes successFlash {
+      0% { background-color: rgba(34, 197, 94, 0); }
+      50% { background-color: rgba(34, 197, 94, 0.3); }
+      100% { background-color: rgba(34, 197, 94, 0); }
+    }
+
+    .success-overlay {
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      pointer-events: none;
+      z-index: 50;
+    }
+
+    .flash-success {
+      animation: successFlash 1s ease-out;
+    }
+
+    .camera-container {
+      position: relative;
+      width: 640px;
+      height: 480px;
+      max-width: 100%;
+      background: #1a1a1a;
+      border-radius: 12px;
+      overflow: hidden;
+      box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+    }
+
+    video, canvas {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      border-radius: 12px;
+    }
+
+    .metrics-container {
+      background: rgba(255, 255, 255, 0.9);
+      backdrop-filter: blur(4px);
+      border-radius: 8px;
+      padding: 1rem;
+      box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+    }
+
+    .debug-panel {
+      font-family: 'Courier New', monospace;
+      background: rgba(0, 0, 0, 0.8);
+      color: #00ff00;
+      padding: 1rem;
+      border-radius: 8px;
+      max-height: 200px;
+      overflow-y: auto;
+    }
+  </style>
+</head>
+<body class="bg-gray-100 min-h-screen">
+  <div class="success-overlay" id="successOverlay"></div>
+  
+  <div class="container mx-auto px-4 py-8">
+    <div class="text-center mb-8">
+      <h1 class="text-4xl font-bold text-gray-800 mb-2">AI Squat Coach</h1>
+      <p class="text-gray-600">Stand back to show your full body in the camera</p>
+    </div>
+
+    <div class="flex flex-col lg:flex-row gap-8 justify-center items-start">
+      <div class="flex flex-col items-center">
+        <div class="camera-container mb-4">
+          <video id="webcam" autoplay playsinline muted></video>
+          <canvas id="output"></canvas>
+        </div>
+        
+        <div class="metrics-container w-full">
+          <div class="grid grid-cols-2 gap-4">
+            <div class="text-center">
+              <p class="text-gray-600 text-sm">Status</p>
+              <p id="status" class="font-semibold text-lg text-gray-800">Initializing...</p>
+            </div>
+            <div class="text-center">
+              <p class="text-gray-600 text-sm">Squats</p>
+              <p id="squatCount" class="font-bold text-3xl text-green-600">0</p>
+            </div>
+          </div>
+          
+          <div class="mt-4">
+            <div class="relative pt-1">
+              <div class="flex items-center justify-between mb-2">
+                <div class="text-gray-600 text-sm">Squat Depth</div>
+                <div id="squatDepth" class="text-green-600 font-semibold">0%</div>
+              </div>
+              <div class="overflow-hidden h-2 text-xs flex rounded bg-gray-200">
+                <div id="depthBar" class="w-0 flex flex-col text-center whitespace-nowrap text-white justify-center bg-green-500 transition-all duration-300"></div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="w-full lg:w-80">
+        <div class="bg-white rounded-lg p-6 shadow-lg">
+          <h2 class="text-lg font-semibold mb-4">Instructions</h2>
+          <ol class="space-y-2 text-gray-600">
+            <li>1. Allow camera access when prompted</li>
+            <li>2. Stand back so your full body is visible</li>
+            <li>3. Wait for calibration to complete</li>
+            <li>4. Perform squats at a moderate pace</li>
+            <li>5. Maintain proper form throughout</li>
+          </ol>
+        </div>
+
+        <div class="mt-4 debug-panel hidden" id="debugText">
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const video = document.getElementById('webcam');
+    const canvas = document.getElementById('output');
+    const ctx = canvas.getContext('2d');
+    const statusElement = document.getElementById('status');
+    const squatCountElement = document.getElementById('squatCount');
+    const squatDepthElement = document.getElementById('squatDepth');
+    const debugTextElement = document.getElementById('debugText');
+    const depthBar = document.getElementById('depthBar');
+    const successOverlay = document.getElementById('successOverlay');
+
+    let squatCount = 0;
+    let isInSquat = false;
+    let lastSquatTime = 0;
+    let calibrationHeight = null;
+    
+    const CONFIDENCE_THRESHOLD = 0.3;
+    const SQUAT_DEPTH_THRESHOLD = 0.15;
+    const SQUAT_COOLDOWN = 1000;
+
+    function flashSuccess() {
+      successOverlay.classList.remove('flash-success');
+      void successOverlay.offsetWidth; // Trigger reflow
+      successOverlay.classList.add('flash-success');
+    }
+
+    async function setupCamera() {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ 
+          video: { 
+            width: 640,
+            height: 480,
+            frameRate: { ideal: 30 }
+          } 
+        });
+        video.srcObject = stream;
+        
+        return new Promise((resolve) => {
+          video.onloadedmetadata = () => {
+            video.play();
+            canvas.width = video.videoWidth;
+            canvas.height = video.videoHeight;
+            resolve();
+          };
+        });
+      } catch (error) {
+        console.error('Error accessing webcam:', error);
+        statusElement.textContent = `Camera Error`;
+        alert('Please allow camera access and ensure your device has a functional webcam.');
+      }
+    }
+
+    async function loadPoseModel() {
+      const detectorConfig = {
+        modelType: poseDetection.movenet.modelType.SINGLEPOSE_LIGHTNING,
+        enableSmoothing: true
+      };
+      try {
+        const detector = await poseDetection.createDetector(
+          poseDetection.SupportedModels.MoveNet,
+          detectorConfig
+        );
+        statusElement.textContent = "Ready";
+        return detector;
+      } catch (error) {
+        console.error('Error loading pose model:', error);
+        statusElement.textContent = "Model Error";
+        return null;
+      }
+    }
+
+    function calculateSquatMetrics(keypoints) {
+      const hip = keypoints.find(kp => kp.name === 'left_hip' || kp.name === 'right_hip');
+      const knee = keypoints.find(kp => kp.name === 'left_knee' || kp.name === 'right_knee');
+      const ankle = keypoints.find(kp => kp.name === 'left_ankle' || kp.name === 'right_ankle');
+
+      if (!hip || !knee || !ankle || 
+          hip.score < CONFIDENCE_THRESHOLD || 
+          knee.score < CONFIDENCE_THRESHOLD || 
+          ankle.score < CONFIDENCE_THRESHOLD) {
+        return null;
+      }
+
+      return {
+        hipHeight: hip.y,
+        kneeHeight: knee.y,
+        ankleHeight: ankle.y
+      };
+    }
+
+    function detectSquat(metrics) {
+      if (!metrics) {
+        statusElement.textContent = "Align to Camera";
+        return;
+      }
+
+      if (!calibrationHeight) {
+        calibrationHeight = metrics.hipHeight;
+        statusElement.textContent = "Calibrated";
+        return;
+      }
+
+      const relativeDepth = (metrics.hipHeight - calibrationHeight) / (canvas.height * 0.3);
+      const squatDepth = Math.max(0, Math.min(100, relativeDepth * 100));
+      squatDepthElement.textContent = `${Math.round(squatDepth)}%`;
+      depthBar.style.width = `${Math.round(squatDepth)}%`;
+
+      debugTextElement.textContent = `
+Hip: ${metrics.hipHeight.toFixed(1)}
+Knee: ${metrics.kneeHeight.toFixed(1)}
+Ankle: ${metrics.ankleHeight.toFixed(1)}
+Calibration: ${calibrationHeight.toFixed(1)}
+Depth: ${relativeDepth.toFixed(2)}
+      `;
+
+      const currentTime = Date.now();
+      if (!isInSquat && relativeDepth > SQUAT_DEPTH_THRESHOLD) {
+        isInSquat = true;
+        statusElement.textContent = "Squatting";
+      } else if (isInSquat && relativeDepth < SQUAT_DEPTH_THRESHOLD / 2 && 
+                 currentTime - lastSquatTime > SQUAT_COOLDOWN) {
+        isInSquat = false;
+        lastSquatTime = currentTime;
+        squatCount++;
+        squatCountElement.textContent = squatCount;
+        flashSuccess();
+        statusElement.textContent = "Great Form!";
+      }
+    }
+
+    function drawKeypointsAndSkeleton(keypoints) {
+      keypoints.forEach(keypoint => {
+        if (keypoint.score > CONFIDENCE_THRESHOLD) {
+          ctx.beginPath();
+          ctx.arc(keypoint.x, keypoint.y, 4, 0, 2 * Math.PI);
+          ctx.fillStyle = '#22c55e';
+          ctx.fill();
+        }
+      });
+
+      const connections = [
+        ['left_shoulder', 'right_shoulder'],
+        ['left_shoulder', 'left_hip'],
+        ['right_shoulder', 'right_hip'],
+        ['left_hip', 'right_hip'],
+        ['left_hip', 'left_knee'],
+        ['right_hip', 'right_knee'],
+        ['left_knee', 'left_ankle'],
+        ['right_knee', 'right_ankle']
+      ];
+
+      ctx.strokeStyle = '#22c55e';
+      ctx.lineWidth = 2;
+      connections.forEach(([first, second]) => {
+        const firstPoint = keypoints.find(kp => kp.name === first);
+        const secondPoint = keypoints.find(kp => kp.name === second);
+
+        if (firstPoint && secondPoint &&
+            firstPoint.score > CONFIDENCE_THRESHOLD &&
+            secondPoint.score > CONFIDENCE_THRESHOLD) {
+          ctx.beginPath();
+          ctx.moveTo(firstPoint.x, firstPoint.y);
+          ctx.lineTo(secondPoint.x, secondPoint.y);
+          ctx.stroke();
+        }
+      });
+    }
+
+    async function startDetection(detector) {
+      if (!detector) {
+        statusElement.textContent = "Error";
+        return;
+      }
+
+      async function detect() {
+        try {
+          const poses = await detector.estimatePoses(video, {
+            flipHorizontal: false
+          });
+
+          ctx.clearRect(0, 0, canvas.width, canvas.height);
+          ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+          if (poses && poses.length > 0) {
+            const keypoints = poses[0].keypoints;
+            const metrics = calculateSquatMetrics(keypoints);
+            detectSquat(metrics);
+            drawKeypointsAndSkeleton(keypoints);
+          } else {
+            statusElement.textContent = "No Pose";
+          }
+        } catch (error) {
+          console.error('Error during pose detection:', error);
+          statusElement.textContent = "Error";
+        }
+
+        requestAnimationFrame(detect);
+      }
+
+      detect();
+    }
+
+    async function main() {
+      try {
+        await setupCamera();
+        const detector = await loadPoseModel();
+        if (detector) {
+          startDetection(detector);
+        }
+      } catch (error) {
+        console.error('Error in main:', error);
+        statusElement.textContent = "Error";
+      }
+    }
+
+    main();
+  </script>
+</body>
+</html>
